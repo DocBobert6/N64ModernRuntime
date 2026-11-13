@@ -90,6 +90,12 @@ namespace recomp {
     bool load_stored_rom(std::u8string& game_id);
     RomValidationError select_rom(const std::filesystem::path& rom_path, std::u8string& game_id);
     bool is_rom_valid(std::u8string& game_id);
+    // [wcw diag] Fresh on-disk re-validation of the stored ROM (unlike
+    // is_rom_valid, which only reads the set populated once at startup), and
+    // a one-line display status for the launcher's ROM state row (empty when
+    // no valid stored ROM exists).
+    bool is_stored_rom_valid(std::u8string& game_id);
+    std::string stored_rom_status(std::u8string& game_id);
     bool is_rom_loaded();
     void set_rom_contents(std::vector<uint8_t>&& new_rom);
     std::span<const uint8_t> get_rom();

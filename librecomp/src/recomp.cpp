@@ -373,6 +373,56 @@ bool recomp::is_rom_valid(std::u8string& game_id) {
     return valid_game_roms.contains(game_id);
 }
 
+// [wcw diag] Fresh on-disk check: is_rom_valid only reads valid_game_roms,
+// which check_all_stored_roms populates ONCE at startup, so it stays false
+// for a ROM imported in this session. The launcher's Start guard needs the
+// truth right now, not at startup. Reuses check_stored_rom, so a stored copy
+// that fails its hash is removed (self-heal) and reports invalid.
+bool recomp::is_stored_rom_valid(std::u8string& game_id) {
+    auto find_it = game_roms.find(game_id);
+
+    if (find_it == game_roms.end()) {
+        return false;
+    }
+
+    return check_stored_rom(find_it->second);
+}
+
+// [wcw diag] One-line display status for the stored ROM, for the launcher's
+// ROM state row: "<display name> — <size> MB — SHA1 <first 8>… — validated".
+// Empty when there is no stored copy or it fails validation (in which case
+// check_stored_rom has already removed the bad copy).
+std::string recomp::stored_rom_status(std::u8string& game_id) {
+    auto find_it = game_roms.find(game_id);
+
+    if (find_it == game_roms.end()) {
+        return std::string{};
+    }
+
+    const recomp::GameEntry& game_entry = find_it->second;
+
+    if (!check_stored_rom(game_entry)) {
+        return std::string{};
+    }
+
+    std::filesystem::path stored_path = config_path / game_entry.stored_filename();
+    std::error_code ec;
+    uintmax_t size = std::filesystem::file_size(stored_path, ec);
+    if (ec) {
+        return std::string{};
+    }
+
+    std::optional<std::string> sha1 = recomp::packages::sha1_file(stored_path);
+    if (!sha1.has_value() || sha1->size() < 8) {
+        return std::string{};
+    }
+
+    std::ostringstream out;
+    out << game_entry.display_name << " — " << (size / (1024 * 1024)) << " MB — SHA1 "
+        << sha1->substr(0, 8) << "… — validated";
+    return out.str();
+}
+
 void recomp::check_all_stored_roms() {
     for (const auto& cur_rom_entry: game_roms) {
         if (check_stored_rom(cur_rom_entry.second)) {
@@ -566,8 +616,16 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
         }
     }
 
-    write_file(config_path / game_entry.stored_filename(), rom_data);
-    
+    // [wcw diag] write_file returns bool and the old code discarded it:
+    // a failed stored-ROM write still returned Good, so the launcher showed
+    // "Start Game" for a ROM that was never stored, and Start then ran the
+    // game with no ROM (see wait_for_game_started). Report the failure.
+    if (!write_file(config_path / game_entry.stored_filename(), rom_data)) {
+        fprintf(stderr, "[recomp] select_rom: failed to write stored ROM %s\n",
+            (config_path / game_entry.stored_filename()).string().c_str());
+        return recomp::RomValidationError::OtherError;
+    }
+
     return recomp::RomValidationError::Good;
 }
 
@@ -949,7 +1007,23 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
         case GameStatus::Running:
             {
                 if (!recomp::load_stored_rom(current_game.value())) {
+                    fprintf(stderr, "[recomp] start aborted: stored ROM could not be loaded (no validated ROM on disk)\n");
                     ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
+                    // [wcw diag] Do NOT fall through to init()/entrypoint
+                    // with an empty ROM: the boot DMA refuses out-of-range
+                    // reads, but do_rom_pio and the entrypoint dereference
+                    // rom.data() unguarded, so the process dies with a
+                    // black screen and no message. Return to the launcher
+                    // instead, mirroring the mod-load-error pattern below
+                    // (None first, so a quit requested while the box was
+                    // up is still honoured and the thread waits cleanly).
+                    game_status.store(GameStatus::None);
+                    if (exited.load()) {
+                        game_status.store(GameStatus::Quit);
+                        game_status.notify_all();
+                        return true;
+                    }
+                    return false;
                 }
 
                 auto find_it = game_roms.find(current_game.value());
