@@ -1,0 +1,1199 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <cmath>
+#include <unordered_map>
+#include <unordered_set>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <optional>
+#include <mutex>
+#include <array>
+#include <cinttypes>
+#include <cuchar>
+#include <charconv>
+
+#include "recomp.h"
+#include "librecomp/stall_rules.hpp"
+#include "librecomp/dd_breadcrumb.hpp"
+#include "librecomp/overlays.hpp"
+#include "librecomp/game.hpp"
+#include "xxHash/xxh3.h"
+#include "ultramodern/ultramodern.hpp"
+#include "ultramodern/error_handling.hpp"
+#include "librecomp/addresses.hpp"
+#include "librecomp/mods.hpp"
+#include "librecomp/conversion.hpp"
+#include "librecomp/packages.hpp"
+#include "librecomp/save_backups.hpp"
+#include "librecomp/startup_shutdown.hpp"
+#include "recompiler/live_recompiler.h"
+
+#ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    include <Windows.h>
+#else
+#    include <sys/mman.h>
+#endif
+
+#if defined(_WIN32)
+#define PATHFMT "%ls"
+#else
+#define PATHFMT "%s"
+#endif
+
+enum GameStatus {
+    None,
+    Running,
+    Quit
+};
+
+// Mutexes
+std::mutex game_roms_mutex;
+std::mutex current_game_mutex;
+std::mutex mod_context_mutex{};
+
+// Global variables
+std::filesystem::path config_path;
+// Maps game_id to the game's entry.
+std::unordered_map<std::u8string, recomp::GameEntry> game_roms {};
+// The global mod context.
+std::unique_ptr<recomp::mods::ModContext> mod_context = std::make_unique<recomp::mods::ModContext>();
+
+// [wcw saves] The save file the backup menu works on (save_backups.hpp): the running game's, or before a game has
+// started, the first registered game's stock save (the ports register one game).
+std::filesystem::path recomp::save_backups::main_save_file() {
+    std::filesystem::path running = ultramodern::get_save_file_path();
+    if (!running.empty()) {
+        return running;
+    }
+
+    std::lock_guard<std::mutex> lock(game_roms_mutex);
+    if (game_roms.empty() || config_path.empty()) {
+        return {};
+    }
+
+    // [wcw fullconv] In the save subfolder (a conversion's or a ROM-patch mod's), like the running game's.
+    const std::u8string subfolder = recomp::get_save_subfolder();
+    const std::filesystem::path folder = subfolder.empty() ? (config_path / u8"saves") : (config_path / u8"saves" / subfolder);
+    return folder / (game_roms.begin()->first + u8".bin");
+}
+
+std::u8string recomp::get_save_subfolder() {
+    std::string out;
+    const std::u8string patch = recomp::mods::get_rom_patch_save_subfolder();
+    // [wcw fullconv] The session's conversion (the launcher's AKI_CONVERSION or the Mods-menu choice, aki-roadmap#57).
+    const std::string conversion_id = recomp::mods::session_conversion_id();
+    if (!recomp::mods::conversion::resolve_save_subfolder(conversion_id.empty() ? nullptr : conversion_id.c_str(),
+        std::string{ reinterpret_cast<const char*>(patch.data()), patch.size() }, out)) {
+        return u8"_invalid_conversion";
+    }
+
+    return std::u8string{ reinterpret_cast<const char8_t*>(out.data()), out.size() };
+}
+// The project's version.
+recomp::Version project_version;
+// The current game's save type.
+recomp::SaveType save_type = recomp::SaveType::None;
+
+std::u8string recomp::GameEntry::stored_filename() const {
+    return game_id + u8".z64";
+}
+
+void recomp::register_config_path(std::filesystem::path path) {
+    config_path = path;
+}
+
+std::filesystem::path recomp::get_config_path() {
+    return config_path;
+}
+
+bool recomp::register_game(const recomp::GameEntry& entry) {
+    if (entry.display_name.empty()) {
+        ultramodern::error_handling::message_box("Game display name was not set.");
+        ULTRAMODERN_QUICK_EXIT();
+    }
+    // TODO verify that there's no game with this ID already.
+    {
+        std::lock_guard<std::mutex> lock(game_roms_mutex);
+        game_roms.insert({ entry.game_id, entry });
+    }
+    if (!entry.mod_game_id.empty()) {
+        std::lock_guard<std::mutex> lock(mod_context_mutex);
+        mod_context->register_game(entry.mod_game_id);
+    }
+    return true;
+}
+
+void recomp::mods::initialize_mods() {
+    N64Recomp::live_recompiler_init();
+    std::filesystem::create_directories(config_path / mods_directory);
+    std::filesystem::create_directories(config_path / mod_config_directory);
+    mod_context->set_mods_config_path(config_path / "mods.json");
+    mod_context->set_mod_config_directory(config_path / mod_config_directory);
+}
+
+void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes) {
+    std::lock_guard<std::mutex> lock(mod_context_mutex);
+    mod_context->register_embedded_mod(mod_id, mod_bytes);
+}
+
+void recomp::mods::register_deprecated_mod(const std::string& mod_id, recomp::mods::DeprecationStatus deprecation_status, const Version& maximum_version) {
+    std::lock_guard<std::mutex> lock(mod_context_mutex);
+    mod_context->register_deprecated_mod(mod_id, deprecation_status, maximum_version);
+}
+
+namespace recomp::mods {
+    std::vector<std::filesystem::path> load_active_conversion(const std::filesystem::path &config_path);
+    bool active_conversion_codes_runnable();
+    std::string active_conversion_cheats_mod();
+}
+
+// [wcw] The file names a game installs into mods/ from assets/mods next to its executable (install_bundled_mods).
+// Migration doesn't record them (aki-roadmap#154): the game rewrites them on update.
+static std::vector<std::string> bundled_mod_names() {
+    std::vector<std::string> names;
+    std::filesystem::path exe;
+#ifdef _WIN32
+    wchar_t buf[32768];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, DWORD(std::size(buf)));
+    if (n > 0 && n < std::size(buf)) {
+        exe = std::filesystem::path(std::wstring(buf, n));
+    }
+#else
+    std::error_code exe_ec;
+    exe = std::filesystem::read_symlink("/proc/self/exe", exe_ec);
+#endif
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(exe.parent_path() / "assets" / "mods", ec), end; !exe.empty() && !ec && it != end; it.increment(ec)) {
+        const std::u8string name = it->path().filename().u8string();
+        names.emplace_back(name.begin(), name.end());
+    }
+    return names;
+}
+
+void recomp::mods::scan_mods() {
+    // [wcw] aki-roadmap#154: finish or undo an install a crash interrupted, then install the packages dropped in
+    // <data>/import, before the mod folder is scanned so they load in this session. Once per run: the Mods menu
+    // scans again mid-session, when files the first scan opened could block a swap. Only a port with one game knows
+    // which game a package must be for.
+    static bool packages_imported = false;
+    if (!packages_imported && game_roms.size() == 1) {
+        packages_imported = true;
+        if (const std::string recovered = recomp::packages::recover_interrupted_install(config_path); !recovered.empty()) {
+            printf("[wcw] packages: %s\n", recovered.c_str());
+        }
+        std::error_code ec;
+        const recomp::GameEntry &game = game_roms.begin()->second;
+        const bool migrate = !recomp::packages::migration_done(config_path) && !(std::getenv("AKI_MIGRATE") && std::string(std::getenv("AKI_MIGRATE")) == "0");
+        const bool do_import = std::filesystem::is_directory(config_path / recomp::packages::ImportFolder, ec);
+        const std::string rom_sha1 = (migrate || do_import) ?
+            recomp::packages::sha1_file(config_path / game.stored_filename()).value_or(std::string()) : std::string();
+        if (migrate) {
+            // The first start with the registry: patch-mod hacks become conversions, installed files get recorded
+            // (aki-roadmap#154 step 3; migration.log says what moved). AKI_MIGRATE=0 skips it for one start.
+            recomp::packages::MigrateOptions migrate_options;
+            migrate_options.game_id = game.mod_game_id;
+            migrate_options.rom_sha1 = rom_sha1;
+            migrate_options.bundled_names = bundled_mod_names();
+            for (const std::string &line : recomp::packages::migrate(config_path, migrate_options).lines) {
+                printf("[wcw] packages: %s\n", line.c_str());
+            }
+        }
+        if (do_import) {
+            recomp::packages::InstallOptions options;
+            options.game_id = game.mod_game_id;
+            options.rom_sha1 = rom_sha1;
+            const recomp::Version &version = recomp::get_project_version();
+            if (version.major >= 0) {
+                options.recomp_version = std::to_string(version.major) + "." + std::to_string(version.minor) + "." + std::to_string(version.patch);
+            }
+            recomp::packages::process_import_folder(config_path, options);
+        }
+    }
+    std::vector<recomp::mods::ModOpenErrorDetails> mod_open_errors;
+    // [wcw fullconv] AKI_CONVERSION=<id>: also open the conversion's own mods (its patch, its texture pack).
+    const std::vector<std::filesystem::path> conversion_folders = load_active_conversion(config_path);
+    std::vector<std::string> conversion_mod_ids;
+    std::vector<ModContext::OpenedModKind> stock_mods;
+    {
+        std::lock_guard mod_lock{ mod_context_mutex };
+        mod_open_errors = mod_context->scan_mod_folder(config_path / mods_directory);
+        const size_t stock_mod_count = mod_context->num_opened_mods();
+        stock_mods = mod_context->opened_mod_kinds(0, stock_mod_count);
+        for (const std::filesystem::path &folder : conversion_folders) {
+            for (auto &error : mod_context->scan_mod_folder(folder, false)) {
+                mod_open_errors.emplace_back(std::move(error));
+            }
+        }
+        conversion_mod_ids = mod_context->opened_mod_ids_from(stock_mod_count);
+        // aki-roadmap#226: whether the conversion's models fit beside its patch, decided before the session's mods.
+        const conversion::Conversion *active = active_conversion();
+        if (active && active->has_models) {
+            std::string relink;
+            for (const ModContext::OpenedModKind &m : mod_context->opened_mod_kinds(stock_mod_count, mod_context->num_opened_mods())) {
+                std::vector<char> bytes;
+                if (m.rom_patch && mod_context->read_opened_mod_file(m.id, "relink.json", bytes)) {
+                    relink.assign(bytes.begin(), bytes.end());
+                }
+            }
+            // A bad models component (parse) already says why; otherwise the patch's memory use decides.
+            const std::string refusal = active->models_refusal.empty() ? conversion::models_refusal(relink) : active->models_refusal;
+            set_active_conversion_models_refusal(refusal);
+            if (!refusal.empty()) {
+                fprintf(stderr, "[conversion] models refused: %s. Running without its models.\n", refusal.c_str());
+            }
+        }
+    }
+    for (const auto& cur_error : mod_open_errors) {
+        printf("Error opening mod " PATHFMT ": %s (%s)\n", cur_error.mod_path.c_str(), recomp::mods::error_to_string(cur_error.error).c_str(), cur_error.error_param.c_str());
+    }
+
+    mod_context->load_mods_config();
+    if (!conversion_folders.empty()) {
+        // The conversion's mods (and the cheats engine for its codes) run, plus the player's add-ons it allows: data
+        // packs by default, code add-ons it lists, and whatever the player turned on or off for this conversion
+        // (conversions/<id>/addons.json; aki-roadmap#154). Nothing is saved to mods.json.
+        const conversion::Conversion *active = active_conversion();
+        std::vector<conversion::PlayerMod> player_mods;
+        for (const ModContext::OpenedModKind &m : stock_mods) {
+            player_mods.push_back({ m.id, m.code, m.rom_patch, mod_context->is_mod_enabled(m.id) });
+        }
+        conversion::PlayerAddons player;
+        conversion::Conversion fallback;
+        if (active) {
+            std::ifstream addons_file(config_path / conversion::Folder / std::filesystem::path(std::u8string(active->id.begin(), active->id.end())) / conversion::AddonsFile, std::ios::binary);
+            if (addons_file) {
+                player = conversion::parse_player_addons(std::string(std::istreambuf_iterator<char>(addons_file), std::istreambuf_iterator<char>()));
+            }
+        }
+        std::vector<std::string> why;
+        mod_context->apply_session_enabled_mods(conversion::session_enabled_mods(conversion_mod_ids,
+            active_conversion_codes_runnable(), active_conversion_cheats_mod(), player_mods, active ? *active : fallback, player, &why));
+        for (const std::string &line : why) {
+            fprintf(stderr, "[conversion] %s\n", line.c_str());
+        }
+        for (const std::string &id : conversion_mod_ids) {
+            fprintf(stderr, "[conversion] mod %s enabled for this session\n", id.c_str());
+        }
+    }
+}
+
+void recomp::mods::close_mods() {
+    {
+        std::lock_guard mod_lock{ mod_context_mutex };
+        mod_context->close_mods();
+    }
+}
+
+std::filesystem::path recomp::mods::get_mods_directory() {
+    return config_path / mods_directory;
+}
+
+recomp::mods::ModContentTypeId recomp::mods::register_mod_content_type(const ModContentType& type) {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return mod_context->register_content_type(type);
+}
+
+bool recomp::mods::register_mod_container_type(const std::string& extension, const std::vector<ModContentTypeId>& content_types, bool requires_manifest) {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return mod_context->register_container_type(extension, content_types, requires_manifest);
+}
+
+std::string recomp::mods::get_mod_display_name(size_t mod_index) {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return mod_context->get_mod_display_name(mod_index);
+}
+
+std::filesystem::path recomp::mods::get_mod_path(size_t mod_index) {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return mod_context->get_mod_path(mod_index);
+}
+
+std::pair<std::string, std::string> recomp::mods::get_mod_import_info(size_t mod_index, size_t import_index) {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return mod_context->get_mod_import_info(mod_index, import_index);
+}
+
+recomp::mods::DependencyStatus recomp::mods::is_dependency_met(size_t mod_index, const std::string& dependency_id) {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return mod_context->is_dependency_met(mod_index, dependency_id);
+}
+
+bool check_hash(const std::vector<uint8_t>& rom_data, uint64_t expected_hash) {
+    uint64_t calculated_hash = XXH3_64bits(rom_data.data(), rom_data.size());
+    return calculated_hash == expected_hash;
+}
+
+static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
+    std::vector<uint8_t> ret;
+
+    std::ifstream file{ path, std::ios::binary};
+
+    if (file.good()) {
+        file.seekg(0, std::ios::end);
+        ret.resize(file.tellg());
+        file.seekg(0, std::ios::beg);
+
+        file.read(reinterpret_cast<char*>(ret.data()), ret.size());
+    }
+
+    return ret;
+}
+
+bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
+    std::ofstream out_file{ path, std::ios::binary };
+
+    if (!out_file.good()) {
+        return false;
+    }
+
+    out_file.write(reinterpret_cast<const char*>(data.data()), data.size());
+
+    return true;
+}
+
+bool check_stored_rom(const recomp::GameEntry& game_entry) {
+    std::vector stored_rom_data = read_file(config_path / game_entry.stored_filename());
+
+    if (!check_hash(stored_rom_data, game_entry.rom_hash)) {
+        // Incorrect hash, remove the stored ROM file if it exists.
+        std::filesystem::remove(config_path / game_entry.stored_filename());
+        return false;
+    }
+
+    return true;
+}
+
+static std::unordered_set<std::u8string> valid_game_roms;
+
+bool recomp::is_rom_valid(std::u8string& game_id) {
+    return valid_game_roms.contains(game_id);
+}
+
+void recomp::check_all_stored_roms() {
+    for (const auto& cur_rom_entry: game_roms) {
+        if (check_stored_rom(cur_rom_entry.second)) {
+            valid_game_roms.insert(cur_rom_entry.first);
+        }
+    }
+}
+
+bool recomp::load_stored_rom(std::u8string& game_id) {
+    auto find_it = game_roms.find(game_id);
+
+    if (find_it == game_roms.end()) {
+        return false;
+    }
+    
+    std::vector<uint8_t> stored_rom_data = read_file(config_path / find_it->second.stored_filename());
+
+    if (!check_hash(stored_rom_data, find_it->second.rom_hash)) {
+        // The ROM no longer has the right hash, delete it.
+        std::filesystem::remove(config_path / find_it->second.stored_filename());
+        return false;
+    }
+
+    recomp::set_rom_contents(std::move(stored_rom_data));
+    return true;
+}
+
+const recomp::Version& recomp::get_project_version() {
+    return project_version;
+}
+
+bool recomp::Version::from_string(const std::string& str, Version& out) {
+    std::array<size_t, 2> period_indices;
+    size_t cur_pos = 0;
+    uint16_t major;
+    uint16_t minor;
+    uint16_t patch;
+    std::string suffix;
+
+    // Find the 2 required periods.
+    cur_pos = str.find('.', cur_pos);
+    period_indices[0] = cur_pos;
+    cur_pos = str.find('.', cur_pos + 1);
+    period_indices[1] = cur_pos;
+
+    // Check that both were found.
+    if (period_indices[0] == std::string::npos || period_indices[1] == std::string::npos) {
+        return false;
+    }
+
+    // Parse the 3 numbers formed by splitting the string via the periods.
+    std::array<std::from_chars_result, 3> parse_results; 
+    std::array<size_t, 3> parse_starts { 0, period_indices[0] + 1, period_indices[1] + 1 };
+    std::array<size_t, 3> parse_ends { period_indices[0], period_indices[1], str.size() };
+    parse_results[0] = std::from_chars(str.data() + parse_starts[0], str.data() + parse_ends[0], major);
+    parse_results[1] = std::from_chars(str.data() + parse_starts[1], str.data() + parse_ends[1], minor);
+    parse_results[2] = std::from_chars(str.data() + parse_starts[2], str.data() + parse_ends[2], patch);
+
+    // Check that the first two parsed correctly.
+    auto did_parse = [&](size_t i) {
+        return parse_results[i].ec == std::errc{} && parse_results[i].ptr == str.data() + parse_ends[i];
+    };
+    
+    if (!did_parse(0) || !did_parse(1)) {
+        return false;
+    }
+
+    // Check that the third had a successful parse, but not necessarily read all the characters.
+    if (parse_results[2].ec != std::errc{}) {
+        return false;
+    }
+
+    // Allow a plus or minus directly after the third number.
+    if (parse_results[2].ptr != str.data() + parse_ends[2]) {
+        if (*parse_results[2].ptr == '+' || *parse_results[2].ptr == '-') {
+            suffix = str.substr(std::distance(str.data(), parse_results[2].ptr));
+        }
+        // Failed to parse, as nothing is allowed directly after the last number besides a plus or minus.
+        else {
+            return false;
+        }
+    }
+
+    out.major = major;
+    out.minor = minor;
+    out.patch = patch;
+    out.suffix = std::move(suffix);
+    return true;
+}
+
+const std::array<uint8_t, 4> first_rom_bytes { 0x80, 0x37, 0x12, 0x40 };
+
+enum class ByteswapType {
+    NotByteswapped,
+    Byteswapped4,
+    Byteswapped2,
+    Invalid
+};
+
+ByteswapType check_rom_start(const std::vector<uint8_t>& rom_data) {
+    if (rom_data.size() < 4) {
+        return ByteswapType::Invalid;
+    }
+
+    auto check_match = [&](uint8_t index0, uint8_t index1, uint8_t index2, uint8_t index3) {
+        return
+            rom_data[0] == first_rom_bytes[index0] &&
+            rom_data[1] == first_rom_bytes[index1] &&
+            rom_data[2] == first_rom_bytes[index2] &&
+            rom_data[3] == first_rom_bytes[index3];
+    };
+
+    // Check if the ROM is already in the correct byte order.
+    if (check_match(0,1,2,3)) {
+        return ByteswapType::NotByteswapped;
+    }
+
+    // Check if the ROM has been byteswapped in groups of 4 bytes.
+    if (check_match(3,2,1,0)) {
+        return ByteswapType::Byteswapped4;
+    }
+
+    // Check if the ROM has been byteswapped in groups of 2 bytes.
+    if (check_match(1,0,3,2)) {
+        return ByteswapType::Byteswapped2;
+    }
+
+    // No match found.
+    return ByteswapType::Invalid;
+}
+
+void byteswap_data(std::vector<uint8_t>& rom_data, size_t index_xor) {
+    for (size_t rom_pos = 0; rom_pos < rom_data.size(); rom_pos += 4) {
+        uint8_t temp0 = rom_data[rom_pos + 0];
+        uint8_t temp1 = rom_data[rom_pos + 1];
+        uint8_t temp2 = rom_data[rom_pos + 2];
+        uint8_t temp3 = rom_data[rom_pos + 3];
+
+        rom_data[rom_pos + (0 ^ index_xor)] = temp0;
+        rom_data[rom_pos + (1 ^ index_xor)] = temp1;
+        rom_data[rom_pos + (2 ^ index_xor)] = temp2;
+        rom_data[rom_pos + (3 ^ index_xor)] = temp3;
+    }
+}
+
+recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_path, std::u8string& game_id) {
+    auto find_it = game_roms.find(game_id);
+
+    if (find_it == game_roms.end()) {
+        return recomp::RomValidationError::OtherError;
+    }
+
+    const recomp::GameEntry& game_entry = find_it->second;
+
+    std::vector<uint8_t> rom_data = read_file(rom_path);
+
+    if (rom_data.empty()) {
+        return recomp::RomValidationError::FailedToOpen;
+    }
+
+    // Pad the rom to the nearest multiple of 4 bytes.
+    rom_data.resize((rom_data.size() + 3) & ~3);
+
+    ByteswapType byteswap_type = check_rom_start(rom_data);
+
+    switch (byteswap_type) {
+        case ByteswapType::Invalid:
+            return recomp::RomValidationError::NotARom;
+        case ByteswapType::Byteswapped2:
+            byteswap_data(rom_data, 1);
+            break;
+        case ByteswapType::Byteswapped4:
+            byteswap_data(rom_data, 3);
+            break;
+        case ByteswapType::NotByteswapped:
+            break;
+    }
+
+    if (!check_hash(rom_data, game_entry.rom_hash)) {
+        const std::string_view name{ reinterpret_cast<const char*>(rom_data.data()) + 0x20, game_entry.internal_name.size()};
+        if (name == game_entry.internal_name) {
+            return recomp::RomValidationError::IncorrectVersion;
+        }
+        else {
+            if (game_entry.is_enabled && std::string_view{ reinterpret_cast<const char*>(rom_data.data()) + 0x20, 19 } == game_entry.internal_name) {
+                return recomp::RomValidationError::NotYet;
+            }
+            else {
+                return recomp::RomValidationError::IncorrectRom;
+            }
+        }
+    }
+
+    write_file(config_path / game_entry.stored_filename(), rom_data);
+    
+    return recomp::RomValidationError::Good;
+}
+
+extern "C" void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
+    ctx->r2 = 8 * 1024 * 1024;
+}
+
+enum class StatusReg {
+    FR = 0x04000000,
+};
+
+extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
+    uint32_t old_sr = ctx->status_reg;
+    uint32_t new_sr = (uint32_t)value;
+    uint32_t changed = old_sr ^ new_sr;
+
+    // Check if the FR bit changed
+    if (changed & (uint32_t)StatusReg::FR) {
+        // Check if the FR bit was set
+        if (new_sr & (uint32_t)StatusReg::FR) {
+            // FR = 1, odd single floats point to their own registers
+            ctx->f_odd = &ctx->f1.u32l;
+            ctx->mips3_float_mode = true;
+        }
+        // Otherwise, it was cleared
+        else {
+            // FR = 0, odd single floats point to the upper half of the previous register
+            ctx->f_odd = &ctx->f0.u32h;
+            ctx->mips3_float_mode = false;
+        }
+
+        // Remove the FR bit from the changed bits as it's been handled
+        changed &= ~(uint32_t)StatusReg::FR;
+    }
+
+    // If any other bits were changed, assert false as they're not handled currently
+    if (changed) {
+        printf("Unhandled status register bits changed: 0x%08X\n", changed);
+        assert(false);
+        exit(EXIT_FAILURE);
+    }
+    
+    // Update the status register in the context
+    ctx->status_reg = new_sr;
+}
+
+extern "C" gpr cop0_status_read(recomp_context* ctx) {
+    return (gpr)(int32_t)ctx->status_reg;
+}
+
+extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
+    printf("Switch-case out of bounds in %s at 0x%08X for jump table at 0x%08X\n", func, vram, jtbl);
+    {
+        // [wcw] The last event to the local Datadog Agent (WCW_DD_METRICS, aki-roadmap#125).
+        char text[160];
+        snprintf(text, sizeof(text), "in %s at 0x%08X, jump table 0x%08X; the game exits", func, vram, jtbl);
+        recomp::dd::fatal("switch-case out of bounds", text);
+    }
+    assert(false);
+    exit(EXIT_FAILURE);
+}
+
+extern "C" void do_break(uint32_t vram) {
+    printf("Encountered break at original vram 0x%08X\n", vram);
+    {
+        char text[96];
+        snprintf(text, sizeof(text), "at original vram 0x%08X; the game exits", vram);
+        recomp::dd::fatal("break", text);
+    }
+    assert(false);
+    exit(EXIT_FAILURE);
+}
+
+std::string current_game_mode_id;
+std::optional<std::u8string> current_game = std::nullopt;
+std::atomic<GameStatus> game_status = GameStatus::None;
+
+void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
+    auto find_it = game_roms.find(current_game.value());
+    const recomp::GameEntry& game_entry = find_it->second;
+    
+    recomp_context ctx{};
+    ctx.r29 = sp;
+    ctx.r4 = arg;
+    ctx.mips3_float_mode = 0;
+    ctx.f_odd = &ctx.f0.u32h;
+
+    if (game_entry.thread_create_callback != nullptr) {
+        game_entry.thread_create_callback(rdram, &ctx);
+    }
+
+    recomp_func_t* func = get_function(addr);
+    func(rdram, &ctx);
+}
+
+void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+    // Initialize the overlays
+    recomp::overlays::init_overlays();
+
+    // Load overlays in the first 1MB
+    load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
+
+    // [wcw2k] Register boot-resident swap overlays at their own link addresses (WM2000
+    // block-copies them out of the boot image with the CPU — no DMA to hook). No-op for
+    // WT/Revenge; see overlays.cpp.
+    load_boot_resident_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
+
+    // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
+    recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
+
+    // Read in any extra data from patches
+    recomp::overlays::read_patch_data(rdram, (gpr)recomp::patch_rdram_start);
+
+    // Set up context floats
+    ctx->f_odd = &ctx->f0.u32h;
+    ctx->mips3_float_mode = false;
+
+    // Initialize variables normally set by IPL3
+    constexpr int32_t osTvType = 0x80000300;
+    //constexpr int32_t osRomType = 0x80000304;
+    constexpr int32_t osRomBase = 0x80000308;
+    constexpr int32_t osResetType = 0x8000030c;
+    //constexpr int32_t osCicId = 0x80000310;
+    //constexpr int32_t osVersion = 0x80000314;
+    constexpr int32_t osMemSize = 0x80000318;
+    //constexpr int32_t osAppNMIBuffer = 0x8000031c;
+    MEM_W(osTvType, 0) = 1; // NTSC
+    MEM_W(osRomBase, 0) = 0xB0000000u; // standard rom base
+    MEM_W(osResetType, 0) = 0; // cold reset
+    MEM_W(osMemSize, 0) = 8 * 1024 * 1024; // 8MB
+}
+
+std::u8string recomp::current_game_id() {
+    std::lock_guard<std::mutex> lock(current_game_mutex);
+    return current_game.value();
+};
+
+std::string recomp::current_mod_game_id() {
+    auto find_it = game_roms.find(current_game_id());
+    const recomp::GameEntry& game_entry = find_it->second;
+
+    return game_entry.mod_game_id;
+}
+
+void recomp::start_game(const std::u8string& game_id, const std::string& game_mode_id) {
+    std::lock_guard<std::mutex> lock(current_game_mutex);
+    current_game_mode_id = game_mode_id;
+    current_game = game_id;
+    game_status.store(GameStatus::Running);
+    game_status.notify_all();
+    mods::set_latest_game_mode_id(game_mode_id);
+}
+
+bool ultramodern::is_game_started() {
+    return game_status.load() != GameStatus::None;
+}
+
+std::atomic_bool exited = false;
+// [wcw fix] Set by the game start thread once ultramodern::preinit has returned (the gfx
+// thread has finished creating the renderer). See recomp::pump_until_startup_done.
+static std::atomic_bool preinit_done = false;
+moodycamel::LightweightSemaphore graphics_shutdown_ready;
+
+void ultramodern::quit() {
+    exited.store(true);
+    GameStatus desired = GameStatus::None;
+    game_status.compare_exchange_strong(desired, GameStatus::Quit);
+    game_status.notify_all();
+    std::lock_guard<std::mutex> lock(current_game_mutex);
+    current_game.reset();
+}
+
+void recomp::mods::enable_mod(const std::string& mod_id, bool enabled) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->enable_mod(mod_id, enabled, true);
+}
+
+bool recomp::mods::is_mod_enabled(const std::string& mod_id) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->is_mod_enabled(mod_id);
+}
+
+bool recomp::mods::is_mod_auto_enabled(const std::string& mod_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->is_mod_auto_enabled(mod_id);
+}
+
+bool recomp::mods::is_mod_deprecated(const std::string& mod_id, const recomp::Version& mod_version) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->is_mod_deprecated(mod_id, mod_version);
+}
+
+recomp::mods::DeprecationStatus recomp::mods::get_mod_deprecation_status(const std::string& mod_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_deprecation_status(mod_id);
+}
+
+recomp::Version recomp::mods::get_mod_deprecation_version(const std::string& mod_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_deprecation_version(mod_id);
+}
+
+std::string recomp::mods::deprecation_status_to_message(DeprecationStatus deprecation_status) {
+    switch (deprecation_status) {
+    case DeprecationStatus::Integrated:
+        return "This mod has already been integrated into the game";
+    case DeprecationStatus::BrokenVersion:
+        return "This version of the mod is known to cause issues. Please update it";
+    case DeprecationStatus::BrokenPermanent:
+        return "This mod is known to cause issues. Please uninstall it";
+    default:
+        return "Reason is unknown";
+    }
+}
+
+const recomp::config::ConfigSchema &recomp::mods::get_mod_config_schema(const std::string &mod_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_config_schema(mod_id);
+}
+
+recomp::config::Config *recomp::mods::get_mod_config(const std::string &mod_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_config(mod_id);
+}
+
+const std::vector<char> &recomp::mods::get_mod_thumbnail(const std::string &mod_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_thumbnail(mod_id);
+}
+
+void recomp::mods::set_mod_config_value(size_t mod_index, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->set_mod_config_value(mod_index, option_id, value);
+}
+
+void recomp::mods::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->set_mod_config_value(mod_id, option_id, value);
+}
+
+recomp::config::ConfigValueVariant recomp::mods::get_mod_config_value(size_t mod_index, const std::string &option_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_config_value(mod_index, option_id);
+}
+
+recomp::config::ConfigValueVariant recomp::mods::get_mod_config_value(const std::string &mod_id, const std::string &option_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_mod_config_value(mod_id, option_id);
+}
+
+std::string recomp::mods::get_latest_game_mode_id() {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->get_latest_game_mode_id();
+}
+
+void recomp::mods::set_latest_game_mode_id(const std::string& game_mode_id) {
+    std::lock_guard lock{ mod_context_mutex };
+    mod_context->set_latest_game_mode_id(game_mode_id);
+}
+
+std::string recomp::mods::get_mod_id_from_filename(const std::filesystem::path& mod_filename) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_id_from_filename(mod_filename);
+}
+
+std::filesystem::path recomp::mods::get_mod_filename(const std::string& mod_id) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_filename(mod_id);
+}
+
+size_t recomp::mods::get_mod_order_index(const std::string& mod_id) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_order_index(mod_id);
+}
+
+size_t recomp::mods::get_mod_order_index(size_t mod_index) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_order_index(mod_index);
+}
+
+std::optional<recomp::mods::ModDetails> recomp::mods::get_details_for_mod(const std::string& mod_id) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_details_for_mod(mod_id);
+}
+
+std::vector<recomp::mods::ModDetails> recomp::mods::get_all_mod_details(const std::string& mod_game_id) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_all_mod_details(mod_game_id);
+}
+
+std::unordered_map<std::string, recomp::mods::ModKindInfo> recomp::mods::get_mod_kinds() {
+    std::lock_guard lock { mod_context_mutex };
+    std::unordered_map<std::string, ModKindInfo> out;
+    for (const ModContext::OpenedModKind &m : mod_context->opened_mod_kinds(0, mod_context->num_opened_mods())) {
+        out[m.id] = { m.code, m.rom_patch };
+    }
+    return out;
+}
+
+recomp::packages::InstallResult recomp::packages::install_package(const std::filesystem::path &package) {
+    recomp::packages::InstallOptions options;
+    if (game_roms.size() == 1) {
+        const recomp::GameEntry &game = game_roms.begin()->second;
+        options.game_id = game.mod_game_id;
+        options.rom_sha1 = sha1_file(config_path / game.stored_filename()).value_or(std::string());
+    }
+    const recomp::Version &version = recomp::get_project_version();
+    if (version.major >= 0) {
+        options.recomp_version = std::to_string(version.major) + "." + std::to_string(version.minor) + "." + std::to_string(version.patch);
+    }
+    options.source = "launcher";   // installed from inside the game: the same rules as the launcher's
+    return install(package, config_path, options);
+}
+
+size_t recomp::mods::game_mode_count(const std::string& mod_game_id, bool include_disabled) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->game_mode_count(mod_game_id, include_disabled);
+}
+
+recomp::Version recomp::mods::get_mod_version(size_t mod_index) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_version(mod_index);
+}
+
+std::string recomp::mods::get_mod_id(size_t mod_index) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_id(mod_index);
+}
+
+void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::string &mod_id, size_t index) {
+    std::lock_guard lock{ mod_context_mutex };
+    return mod_context->set_mod_index(mod_game_id, mod_id, index);
+}
+
+// [wcw fullconv] With a de-relinked hack active, the low user segment (0x00000000-0x007FFFFF, rdram + 0x80000000 in
+// the reservation) reads as zero pages instead of faulting: hack code tested on lenient emulators reads through
+// pointers that aren't set up yet on the port's first frames (Revenge Starrcade 2.0's per-frame hook walks an audio
+// table before the main thread relocates its offsets). Stock games keep faulting there.
+extern "C" void wcw_commit_low_user_segment(uint8_t* rdram) {
+#ifdef _WIN32
+    if (VirtualAlloc(rdram + 0x80000000ull, 0x800000, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        fprintf(stderr, "[relink] could not map the low user segment\n");
+    }
+#else
+    mprotect(rdram + 0x80000000ull, 0x800000, PROT_READ | PROT_WRITE);
+#endif
+}
+
+// [wcw fullconv] A de-relinked hack that reads the cartridge directly (lw from 0xB0000000 + offset; relink.json
+// direct_rom_reads): the patched ROM is mapped read-only at that address of the reservation, in RDRAM's word order
+// (Revenge Starrcade 2.0 copies a block from ROM 0x2300000 at run time).
+extern "C" void wcw_map_rom_k1(uint8_t* rdram) {
+    std::span<const uint8_t> rom = recomp::get_rom();
+    const size_t size = (rom.size() + 0xFFFF) & ~size_t(0xFFFF);
+    if (size == 0 || size > 0x10000000) {
+        return;
+    }
+    uint8_t* dst = rdram + 0x30000000ull;
+#ifdef _WIN32
+    if (VirtualAlloc(dst, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        fprintf(stderr, "[relink] could not map the ROM for direct reads\n");
+        return;
+    }
+#else
+    mprotect(dst, size, PROT_READ | PROT_WRITE);
+#endif
+    for (size_t i = 0; i + 4 <= rom.size(); i += 4) {
+        const uint32_t w = (uint32_t(rom[i]) << 24) | (uint32_t(rom[i + 1]) << 16) | (uint32_t(rom[i + 2]) << 8) | rom[i + 3];
+        memcpy(dst + i, &w, 4);
+    }
+    fprintf(stderr, "[relink] ROM mapped for direct reads (0x%zX bytes)\n", rom.size());
+}
+
+bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+    game_status.wait(GameStatus::None);
+
+    switch (game_status.load()) {
+        // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
+        case GameStatus::Running:
+            {
+                if (!recomp::load_stored_rom(current_game.value())) {
+                    ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
+                }
+
+                auto find_it = game_roms.find(current_game.value());
+                const recomp::GameEntry& game_entry = find_it->second;
+
+                init(rdram, context, game_entry.entrypoint_address);
+                if (game_entry.on_init_callback) {
+                    game_entry.on_init_callback(rdram, context);
+                }
+
+                uint32_t mod_ram_used = 0;
+                if (!game_entry.mod_game_id.empty()) {
+                    std::vector<recomp::mods::ModLoadErrorDetails> mod_load_errors;
+                    {
+                        std::lock_guard lock { mod_context_mutex };
+                        mod_load_errors = mod_context->load_mods(game_entry, current_game_mode_id, rdram, recomp::mod_rdram_start, mod_ram_used);
+                    }
+
+                    if (!mod_load_errors.empty()) {
+                        std::ostringstream mod_error_stream;
+                        mod_error_stream << "Error loading mods:\n\n";
+                        for (const auto& cur_error : mod_load_errors) {
+                            auto mod_details = recomp::mods::get_details_for_mod(cur_error.mod_id);
+                            if (mod_details) {
+                                mod_error_stream << mod_details->display_name;
+                            }
+                            else {
+                                mod_error_stream << cur_error.mod_id.c_str();
+                            }
+                            mod_error_stream << ": " << recomp::mods::error_to_string(cur_error.error);
+                            if (!cur_error.error_param.empty()) {
+                                mod_error_stream << " (" << cur_error.error_param.c_str() << ")";
+                            }
+                            mod_error_stream << "\n";                                
+                        }
+                        ultramodern::error_handling::message_box(mod_error_stream.str().c_str());
+                        // [wcw fix] A quit requested while the error box was up (quit() only moves None to
+                        // Quit, and the status was Running) would otherwise leave this thread waiting for a start
+                        // that never comes, and the process never exits. None is stored before exited is read
+                        // (both seq_cst): a quit() that comes after the store finds None and moves it to Quit
+                        // itself, and one that came before it is seen here, so no quit falls in between.
+                        game_status.store(GameStatus::None);
+                        if (exited.load()) {
+                            game_status.store(GameStatus::Quit);
+                            game_status.notify_all();
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+
+                recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
+
+                save_type = game_entry.save_type;
+                ultramodern::init_saving(rdram);
+
+                try {
+                    game_entry.entrypoint(rdram, context);
+                } catch (ultramodern::thread_terminated& terminated) {
+
+                }
+            }
+            return true;
+
+        case GameStatus::Quit:
+            return true;
+
+        case GameStatus::None:
+            return true;
+    }
+}
+
+recomp::SaveType recomp::get_save_type() {
+    return save_type;
+}
+
+bool recomp::eeprom_allowed() {
+    return
+        save_type == SaveType::Eep4k || 
+        save_type == SaveType::Eep16k ||
+        save_type == SaveType::AllowAll;
+}
+
+bool recomp::sram_allowed() {
+    return
+        save_type == SaveType::Sram || 
+        save_type == SaveType::AllowAll;
+}
+
+bool recomp::flashram_allowed() {
+    return
+        save_type == SaveType::Flashram || 
+        save_type == SaveType::AllowAll;
+}
+
+void recomp::start(
+    const recomp::Version& version,
+    ultramodern::renderer::WindowHandle window_handle,
+    const recomp::rsp::callbacks_t& rsp_callbacks,
+    const ultramodern::renderer::callbacks_t& renderer_callbacks,
+    const ultramodern::audio_callbacks_t& audio_callbacks,
+    const ultramodern::input::callbacks_t& input_callbacks,
+    const ultramodern::gfx_callbacks_t& gfx_callbacks_,
+    const ultramodern::events::callbacks_t& events_callbacks,
+    const ultramodern::error_handling::callbacks_t& error_handling_callbacks,
+    const ultramodern::threads::callbacks_t& threads_callbacks
+) {
+    project_version = version;
+    recomp::check_all_stored_roms();
+
+    recomp::rsp::set_callbacks(rsp_callbacks);
+
+    static const ultramodern::rsp::callbacks_t ultramodern_rsp_callbacks {
+        .init = recomp::rsp::constants_init,
+        .run_task = recomp::rsp::run_task,
+    };
+
+    ultramodern::set_callbacks(ultramodern_rsp_callbacks, renderer_callbacks, audio_callbacks, input_callbacks, gfx_callbacks_, events_callbacks, error_handling_callbacks, threads_callbacks);
+
+    ultramodern::gfx_callbacks_t gfx_callbacks = gfx_callbacks_;
+
+    ultramodern::gfx_callbacks_t::gfx_data_t gfx_data{};
+
+    if (gfx_callbacks.create_gfx) {
+        gfx_data = gfx_callbacks.create_gfx();
+    }
+
+    if (window_handle == ultramodern::renderer::WindowHandle{}) {
+        if (gfx_callbacks.create_window) {
+            window_handle = gfx_callbacks.create_window(gfx_data);
+        }
+        else {
+            assert(false && "No create_window callback provided");
+        }
+    }
+
+    recomp::mods::initialize_mods();
+    recomp::mods::scan_mods();
+
+    // Allocate rdram without comitting it. Use a platform-specific virtual allocation function
+    // that initializes to zero. Protect the region above the memory size to catch accesses to invalid addresses.
+    uint8_t* rdram;
+    bool alloc_failed;
+#ifdef _WIN32
+    // [wcw fix] Reserve the whole range but commit only mem_size (aki-roadmap#7). Committing all of allocation_size
+    // (4 GB) charged it to the process's private bytes and the system commit limit even though the guard region past
+    // mem_size is PAGE_NOACCESS and never touched: a fresh game showed ~4.5 GB private bytes with RT off. Reserved,
+    // uncommitted pages fault on access just like committed PAGE_NOACCESS ones, so invalid addresses are still caught.
+    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_RESERVE, PAGE_NOACCESS));
+    alloc_failed = (rdram == nullptr);
+    if (!alloc_failed) {
+        // VirtualAlloc returns nullptr on failure; committed pages are zero-initialized.
+        alloc_failed = (VirtualAlloc(rdram, mem_size, MEM_COMMIT, PAGE_READWRITE) == nullptr);
+        if (alloc_failed) {
+            VirtualFree(rdram, 0, MEM_RELEASE);
+        }
+    }
+#else
+    rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
+    if (!alloc_failed) {
+        // mprotect returns -1 on failure.
+        alloc_failed = (mprotect(rdram, mem_size, PROT_READ | PROT_WRITE) == -1);
+        if (alloc_failed) {
+            munmap(rdram, allocation_size);
+        }
+    }
+#endif
+
+    if (alloc_failed) {
+        ultramodern::error_handling::message_box("Failed to allocate memory!");
+        return;
+    }
+
+    recomp::register_heap_exports();
+    recomp::mods::register_config_exports();
+    recomp::mods::register_hook_exports();
+
+    std::thread game_thread{[](ultramodern::renderer::WindowHandle window_handle, uint8_t* rdram) {
+        debug_printf("[Recomp] Starting\n");
+
+        ultramodern::set_native_thread_name("Game Start Thread");
+
+        ultramodern::preinit(rdram, window_handle);
+        preinit_done.store(true);
+        recomp::stall::start_watchdog(rdram); // [wcw] WCW_STALL_DUMP
+
+        recomp_context context{};
+
+        // Loop until the game starts.
+        while (!wait_for_game_started(rdram, &context)) {}
+    }, window_handle, rdram};
+
+    auto pump_gfx = [&gfx_callbacks, &gfx_data]() {
+        if (gfx_callbacks.update_gfx != nullptr) {
+            gfx_callbacks.update_gfx(gfx_data);
+        }
+    };
+    auto sleep_1ms = []() { ultramodern::sleep_milliseconds(1); };
+
+    while (!exited) {
+        sleep_1ms();
+        pump_gfx();
+    }
+
+    // [wcw fix] jessetbh/aki-roadmap#73: a quit during startup must keep the window's messages
+    // flowing until the renderer exists, or the gfx thread (stuck in a cross-thread window
+    // call) and this thread (joining the game thread) deadlock.
+    recomp::pump_until_startup_done(preinit_done, pump_gfx, sleep_1ms);
+
+    graphics_shutdown_ready.signal();
+
+    game_thread.join();
+    // [wcw fix] Shutdown ordering (aki-roadmap#3): stop everything that reads rdram before
+    // releasing it. Game threads park first (their last save writes land before the final
+    // flush in join_saving_thread), then the host threads that serve them stop.
+    bool game_threads_parked = ultramodern::park_game_threads(std::chrono::milliseconds{2000});
+    ultramodern::join_event_threads();
+    ultramodern::join_timer_thread();
+    ultramodern::join_thread_cleaner_thread();
+    ultramodern::join_saving_thread();
+
+    recomp::finish_shutdown(game_threads_parked,
+        [&]() {
+            // Free rdram.
+            bool free_failed;
+#ifdef _WIN32
+            // VirtualFree returns zero on failure.
+            free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+#else
+            // munmap returns -1 on failure.
+            free_failed = (munmap(rdram, allocation_size) == -1);
+#endif
+
+            if (free_failed) {
+                printf("Failed to free rdram\n");
+            }
+        },
+        []() {
+            // aki-roadmap#252: a game thread is still running and may read rdram or anything else, so rdram
+            // stays mapped and no static destructor runs under it. _Exit skips atexit; on Windows the OS
+            // stops the other threads before any DLL detaches.
+            fprintf(stderr, "[wcw] shutdown: ending the process now, a game thread is still running\n");
+            fflush(nullptr);   // every open stream: _Exit flushes none (diagnostic CSVs keep their tail)
+            std::_Exit(0);
+        });
+}
