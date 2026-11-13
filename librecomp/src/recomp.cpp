@@ -1148,7 +1148,16 @@ void recomp::start(
             gfx_callbacks.update_gfx(gfx_data);
         }
     };
-    auto sleep_1ms = []() { ultramodern::sleep_milliseconds(1); };
+    // On Android a 1 ms poll is a pointless 1 kHz wakeup on mobile; input
+    // events still arrive through SDL's own queue, this only paces the
+    // polling loop.
+    auto sleep_1ms = []() {
+#if defined(__ANDROID__)
+        ultramodern::sleep_milliseconds(16);
+#else
+        ultramodern::sleep_milliseconds(1);
+#endif
+    };
 
     while (!exited) {
         sleep_1ms();

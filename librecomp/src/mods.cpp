@@ -223,6 +223,44 @@ void protect(void* target_func, uint64_t old_flags) {
 #  include <unistd.h>
 #  include <dlfcn.h>
 #  include <sys/mman.h>
+#  if defined(__ANDROID__)
+#    include <cstdlib>
+#    include <system_error>
+#    include <sys/stat.h>
+#  endif
+
+#  if defined(__ANDROID__)
+// Android refuses to dlopen libraries from general app storage; stage mod
+// native libraries into the app-provided directory (APP_NATIVE_LIBS_PATH,
+// set from Java) before loading.
+static std::filesystem::path prepare_android_native_library_path(const std::filesystem::path& source_path) {
+    const char* native_libs_path = std::getenv("APP_NATIVE_LIBS_PATH");
+    if (native_libs_path == nullptr || native_libs_path[0] == '\0') {
+        return source_path;
+    }
+
+    std::filesystem::path destination_dir{native_libs_path};
+    std::filesystem::path destination_path = destination_dir / source_path.filename();
+    std::error_code ec;
+
+    std::filesystem::create_directories(destination_dir, ec);
+    if (ec) {
+        fprintf(stderr, "Failed to create Android native mod library dir %s: %s\n",
+            destination_dir.string().c_str(), ec.message().c_str());
+        return source_path;
+    }
+
+    std::filesystem::copy_file(source_path, destination_path, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        fprintf(stderr, "Failed to copy Android native mod library from %s to %s: %s\n",
+            source_path.string().c_str(), destination_path.string().c_str(), ec.message().c_str());
+        return source_path;
+    }
+
+    chmod(destination_path.c_str(), 0700);
+    return destination_path;
+}
+#  endif
 
 class recomp::mods::DynamicLibrary {
 public:
@@ -233,7 +271,16 @@ public:
     #endif
     DynamicLibrary() = default;
     DynamicLibrary(const std::filesystem::path& path) {
-        native_handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        #if defined(__ANDROID__)
+        std::filesystem::path load_path = prepare_android_native_library_path(path);
+        #else
+        const std::filesystem::path& load_path = path;
+        #endif
+        native_handle = dlopen(load_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!good()) {
+            const char* error = dlerror();
+            fprintf(stderr, "dlopen failed for %s: %s\n", load_path.string().c_str(), error != nullptr ? error : "unknown error");
+        }
 
         if (good()) {
             uint32_t* recomp_api_version;
@@ -281,24 +328,29 @@ private:
     uint32_t api_version;
 };
 
+static constexpr size_t PatchSize = 16;
+
 void unprotect(void* target_func, uint64_t* old_flags) {
-    // Align the address to a page boundary.
+    // Cover every page the patch touches; a 16-byte patch can straddle a page boundary.
     uintptr_t page_start = (uintptr_t)target_func;
     int page_size = getpagesize();
     page_start = (page_start / page_size) * page_size;
+    uintptr_t page_end = (uintptr_t)target_func + PatchSize - 1;
+    page_end = (page_end / page_size + 1) * page_size;
 
-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE);
+    int result = mprotect((void*)page_start, page_end - page_start, PROT_READ | PROT_WRITE);
     *old_flags = 0;
     (void)result;
 }
 
 void protect(void* target_func, uint64_t old_flags) {
-    // Align the address to a page boundary.
     uintptr_t page_start = (uintptr_t)target_func;
     int page_size = getpagesize();
     page_start = (page_start / page_size) * page_size;
+    uintptr_t page_end = (uintptr_t)target_func + PatchSize - 1;
+    page_end = (page_end / page_size + 1) * page_size;
 
-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
+    int result = mprotect((void*)page_start, page_end - page_start, PROT_READ | PROT_EXEC);
     (void)result;
 }
 #endif
@@ -653,6 +705,12 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
 #   error "Unsupported architecture"
 #endif
 
+#if defined(IS_ARM64) && !defined(_WIN32)
+    // ARM64 has separate I/D caches; without this the CPU can keep executing
+    // the stale pre-patch instructions.
+    __builtin___clear_cache(reinterpret_cast<char*>(target_func_u8), reinterpret_cast<char*>(target_func_u8) + offset);
+#endif
+
     protect(target_func_u8, old_flags);
 }
 
@@ -660,6 +718,9 @@ void unpatch_func(void* target_func, const recomp::mods::PatchData& data) {
     uint64_t old_flags;
     unprotect(target_func, &old_flags);
     memcpy(target_func, data.replaced_bytes.data(), data.replaced_bytes.size());
+#if defined(IS_ARM64) && !defined(_WIN32)
+    __builtin___clear_cache(reinterpret_cast<char*>(target_func), reinterpret_cast<char*>(target_func) + data.replaced_bytes.size());
+#endif
     protect(target_func, old_flags);
 }
 
