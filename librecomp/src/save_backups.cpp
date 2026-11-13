@@ -118,7 +118,12 @@ namespace recomp {
                 return std::nullopt;
             }
 
-            const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+            // std::chrono::clock_cast is C++20 but unimplemented in libc++
+            // (NDK); convert file_time_type to system_clock::time_point
+            // with the portable epoch-offset idiom (identical result).
+            const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ftime - std::filesystem::file_time_type::clock::now()
+                + std::chrono::system_clock::now());
             return from_time_t(std::chrono::system_clock::to_time_t(sys));
         }
 
