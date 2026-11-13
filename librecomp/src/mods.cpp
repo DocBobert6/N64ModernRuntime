@@ -2255,7 +2255,14 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
 
     // [wcw fullconv] The port's entry prologues go with the static functions they belong to (aki-roadmap#76).
     if (!entry_prologue_of.empty()) {
-        std::vector<const void*> replaced(regenlist.func_ptrs.begin(), regenlist.func_ptrs.end());
+        // [linux] Function pointers don't convert to void* in strict C++ (MSVC/clang-cl
+        // accept it as an extension, clang-18/libstdc++ hard-errors in uninitialized_copy),
+        // so cast each element explicitly instead of range-constructing the vector.
+        std::vector<const void*> replaced;
+        replaced.reserve(regenlist.func_ptrs.size());
+        for (auto* func : regenlist.func_ptrs) {
+            replaced.push_back(reinterpret_cast<const void*>(func));
+        }
         const size_t kept = entry_prologues::add_to_entry_hooks(replaced, entry_prologue_of, regenlist.entry_func_hooks);
         if (kept != 0) {
             fprintf(stderr, "[live recompiler] %zu regenerated function(s) keep the port's entry prologue\n", kept);
