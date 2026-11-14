@@ -1,4 +1,8 @@
 #include <span>
+#include <vector>
+#include <cstdio>
+#include <cerrno>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 #include <map>
@@ -201,23 +205,31 @@ private:
     uint32_t api_version;
 };
 
-void unprotect(void* target_func, uint64_t* old_flags) {
+bool unprotect(void* target_func, uint64_t* old_flags) {
     DWORD old_flags_dword;
     BOOL result = VirtualProtect(target_func,
         16,
         PAGE_READWRITE,
         &old_flags_dword);
     *old_flags = old_flags_dword;
-    (void)result;
+    if (!result) {
+        fprintf(stderr, "[wcw][patch] unprotect FAILED: func %p VirtualProtect returned 0 (GetLastError %lu)\n",
+            target_func, (unsigned long)GetLastError());
+    }
+    return result != FALSE;
 }
 
-void protect(void* target_func, uint64_t old_flags) {
+bool protect(void* target_func, uint64_t old_flags) {
     DWORD dummy_old_flags;
     BOOL result = VirtualProtect(target_func,
         16,
         static_cast<DWORD>(old_flags),
         &dummy_old_flags);
-    (void)result;
+    if (!result) {
+        fprintf(stderr, "[wcw][patch] protect FAILED: func %p VirtualProtect returned 0 (GetLastError %lu) — page left RW\n",
+            target_func, (unsigned long)GetLastError());
+    }
+    return result != FALSE;
 }
 #else
 #  include <unistd.h>
@@ -330,28 +342,170 @@ private:
 
 static constexpr size_t PatchSize = 16;
 
-void unprotect(void* target_func, uint64_t* old_flags) {
-    // Cover every page the patch touches; a 16-byte patch can straddle a page boundary.
-    uintptr_t page_start = (uintptr_t)target_func;
-    int page_size = getpagesize();
-    page_start = (page_start / page_size) * page_size;
-    uintptr_t page_end = (uintptr_t)target_func + PatchSize - 1;
-    page_end = (page_end / page_size + 1) * page_size;
+// [wcw alpha.6] Every page patch_func/unpatch_func touches, recorded so the
+// boot guard (recomp::mods::verify_patched_pages_executable, below) can
+// prove from /proc/self/maps that no patched page is still non-executable
+// when the game threads start. The alpha.4/alpha.5 device logs proved five
+// .text pages were left rw-p — one per hook target of the loaded mods — and
+// thread 17 faulted fetching its entry function off one of them, while
+// both mprotect results here were silently discarded ((void)result).
+struct PatchedPageRange {
+    uintptr_t page_start;
+    uintptr_t page_end;
+};
+static std::vector<PatchedPageRange> patched_page_ranges{};
 
-    int result = mprotect((void*)page_start, page_end - page_start, PROT_READ | PROT_WRITE);
-    *old_flags = 0;
-    (void)result;
+static void record_patched_page_range(uintptr_t page_start, uintptr_t page_end) {
+    for (const auto& range : patched_page_ranges) {
+        if (range.page_start == page_start && range.page_end == page_end) {
+            return;
+        }
+    }
+    patched_page_ranges.push_back({ page_start, page_end });
 }
 
-void protect(void* target_func, uint64_t old_flags) {
-    uintptr_t page_start = (uintptr_t)target_func;
+// Cover every page the patch touches; a 16-byte patch can straddle a page boundary.
+static void patch_page_range(void* target_func, uintptr_t& page_start, uintptr_t& page_end) {
     int page_size = getpagesize();
+    page_start = (uintptr_t)target_func;
     page_start = (page_start / page_size) * page_size;
-    uintptr_t page_end = (uintptr_t)target_func + PatchSize - 1;
+    page_end = (uintptr_t)target_func + PatchSize - 1;
     page_end = (page_end / page_size + 1) * page_size;
+}
 
+bool unprotect(void* target_func, uint64_t* old_flags) {
+    uintptr_t page_start = 0;
+    uintptr_t page_end = 0;
+    patch_page_range(target_func, page_start, page_end);
+
+    errno = 0;
+    int result = mprotect((void*)page_start, page_end - page_start, PROT_READ | PROT_WRITE);
+    *old_flags = 0;
+    if (result != 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "[wcw][patch] unprotect FAILED: func %p page 0x%zx-0x%zx mprotect RW returned %d (errno %d: %s)\n",
+            target_func, (size_t)page_start, (size_t)page_end, result, saved_errno, std::strerror(saved_errno));
+        return false;
+    }
+    return true;
+}
+
+bool protect(void* target_func, uint64_t old_flags) {
+    uintptr_t page_start = 0;
+    uintptr_t page_end = 0;
+    patch_page_range(target_func, page_start, page_end);
+
+    errno = 0;
     int result = mprotect((void*)page_start, page_end - page_start, PROT_READ | PROT_EXEC);
-    (void)result;
+    if (result != 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "[wcw][patch] protect FAILED: func %p page 0x%zx-0x%zx mprotect RX returned %d (errno %d: %s) — page left RW, the game will fault on first execution from it\n",
+            target_func, (size_t)page_start, (size_t)page_end, result, saved_errno, std::strerror(saved_errno));
+        return false;
+    }
+    return true;
+}
+
+// [wcw alpha.6] Boot guard, called from wait_for_game_started after
+// load_mods and before the entrypoint runs (so before any game thread
+// spawns): re-reads /proc/self/maps and proves every page patch_func
+// touched is executable again. A page that is still writable (or not
+// mapped) gets ONE recovery attempt — mprotect to RWX, the same posture
+// the Windows live-code path restores (PAGE_EXECUTE_READWRITE) — and is
+// re-verified; if it is still not executable the function returns false
+// and error_detail names the page(s), and the caller refuses to start the
+// game instead of letting a thread fault on it.
+bool recomp::mods::verify_patched_pages_executable(std::string& error_detail) {
+    error_detail.clear();
+
+    struct MapEntry {
+        uintptr_t start;
+        uintptr_t end;
+        bool writable;
+        bool executable;
+    };
+
+    auto read_maps = []() {
+        std::vector<MapEntry> entries{};
+        std::ifstream maps_file("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps_file, line)) {
+            unsigned long long start = 0;
+            unsigned long long end = 0;
+            char perms[8] = "";
+            if (std::sscanf(line.c_str(), "%llx-%llx %7s", &start, &end, perms) == 3) {
+                entries.push_back({ (uintptr_t)start, (uintptr_t)end, perms[1] == 'w', perms[2] == 'x' });
+            }
+        }
+        return entries;
+    };
+
+    auto find_entry = [](const std::vector<MapEntry>& entries, uintptr_t addr) -> const MapEntry* {
+        for (const auto& entry : entries) {
+            if (entry.start <= addr && addr < entry.end) {
+                return &entry;
+            }
+        }
+        return nullptr;
+    };
+
+    const uintptr_t page_size = (uintptr_t)getpagesize();
+    bool all_ok = true;
+
+    fprintf(stderr, "[wcw][patch] verifying %zu patched page range(s) executable before game start\n", patched_page_ranges.size());
+    for (const auto& range : patched_page_ranges) {
+        for (uintptr_t page = range.page_start; page < range.page_end; page += page_size) {
+            std::vector<struct MapEntry> entries = read_maps();
+            const struct MapEntry* entry = find_entry(entries, page);
+            bool executable = entry != nullptr && entry->executable && !entry->writable;
+            if (executable) {
+                fprintf(stderr, "[wcw][patch] verify page 0x%zx: executable OK\n", (size_t)page);
+                continue;
+            }
+
+            fprintf(stderr, "[wcw][patch] verify page 0x%zx: NOT EXECUTABLE (%s) — attempting RWX recovery\n",
+                (size_t)page, entry == nullptr ? "not mapped" : (entry->writable ? "still writable" : "not executable"));
+            errno = 0;
+            int recover_result = mprotect((void*)page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+            if (recover_result != 0) {
+                int saved_errno = errno;
+                fprintf(stderr, "[wcw][patch] RWX recovery FAILED for page 0x%zx: mprotect returned %d (errno %d: %s)\n",
+                    (size_t)page, recover_result, saved_errno, std::strerror(saved_errno));
+            } else {
+                entries = read_maps();
+                entry = find_entry(entries, page);
+                executable = entry != nullptr && entry->executable;
+                fprintf(stderr, "[wcw][patch] RWX recovery for page 0x%zx: %s\n",
+                    (size_t)page, executable ? "recovered (page executable again, continuing with a warning)" : "mprotect claimed success but the page is still not executable");
+            }
+
+            if (!executable) {
+                all_ok = false;
+                std::ostringstream detail;
+                detail << "page 0x" << std::hex << (size_t)page << " still not executable after patching ("
+                       << (entry == nullptr ? "not mapped" : (entry->writable ? "left writable" : "not executable")) << ")";
+                if (!error_detail.empty()) {
+                    error_detail += "; ";
+                }
+                error_detail += detail.str();
+            }
+        }
+    }
+
+    if (patched_page_ranges.empty()) {
+        fprintf(stderr, "[wcw][patch] verify: no patched pages recorded (no hooks applied)\n");
+    }
+    return all_ok;
+}
+#endif
+
+#if defined(_WIN32)
+// Windows stub (declared in mods.hpp): no /proc/self/maps, and the Windows
+// live-code path restores PAGE_EXECUTE_READWRITE, so patched pages stay
+// executable by construction.
+bool recomp::mods::verify_patched_pages_executable(std::string& error_detail) {
+    error_detail.clear();
+    return true;
 }
 #endif
 
@@ -681,7 +835,7 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
     };
 
     uint64_t old_flags;
-    unprotect(target_func_u8, &old_flags);
+    bool unprotected = unprotect(target_func_u8, &old_flags);
 
 #if defined(IS_X86_64)
     static const uint8_t movabs_rax[] = {0x48, 0xB8};
@@ -711,17 +865,42 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
     __builtin___clear_cache(reinterpret_cast<char*>(target_func_u8), reinterpret_cast<char*>(target_func_u8) + offset);
 #endif
 
-    protect(target_func_u8, old_flags);
+    bool protected_ok = protect(target_func_u8, old_flags);
+#if !defined(_WIN32)
+    // [wcw alpha.6] Complete patch history for the diagnostics log: every
+    // patch application, its page, and both mprotect results. The boot guard
+    // (verify_patched_pages_executable) re-checks these pages from
+    // /proc/self/maps before the game threads start.
+    {
+        uintptr_t page_start = 0;
+        uintptr_t page_end = 0;
+        patch_page_range(target_func_u8, page_start, page_end);
+        record_patched_page_range(page_start, page_end);
+        fprintf(stderr, "[wcw][patch] patched func %p page 0x%zx-0x%zx unprotect=%s protect=%s\n",
+            (void*)target_func_u8, (size_t)page_start, (size_t)page_end,
+            unprotected ? "ok" : "FAILED", protected_ok ? "ok" : "FAILED");
+    }
+#else
+    (void)unprotected;
+    (void)protected_ok;
+#endif
 }
 
 void unpatch_func(void* target_func, const recomp::mods::PatchData& data) {
     uint64_t old_flags;
-    unprotect(target_func, &old_flags);
+    bool unprotected = unprotect(target_func, &old_flags);
     memcpy(target_func, data.replaced_bytes.data(), data.replaced_bytes.size());
 #if defined(IS_ARM64) && !defined(_WIN32)
     __builtin___clear_cache(reinterpret_cast<char*>(target_func), reinterpret_cast<char*>(target_func) + data.replaced_bytes.size());
 #endif
-    protect(target_func, old_flags);
+    bool protected_ok = protect(target_func, old_flags);
+#if !defined(_WIN32)
+    fprintf(stderr, "[wcw][patch] unpatched func %p unprotect=%s protect=%s\n",
+        target_func, unprotected ? "ok" : "FAILED", protected_ok ? "ok" : "FAILED");
+#else
+    (void)unprotected;
+    (void)protected_ok;
+#endif
 }
 
 void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
@@ -1788,6 +1967,11 @@ std::u8string recomp::mods::get_rom_patch_save_subfolder() {
 std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mods(const GameEntry& game_entry, const std::string& game_mode_id, uint8_t* rdram, int32_t load_address, uint32_t& ram_used) {
     std::vector<recomp::mods::ModLoadErrorDetails> ret{};
     rom_patch_save_subfolder.clear();
+#if !defined(_WIN32)
+    // [wcw alpha.6] Fresh patch record for this boot: the guard after
+    // load_mods checks exactly the pages patched in this load.
+    patched_page_ranges.clear();
+#endif
     ram_used = 0;
     num_events = recomp::overlays::num_base_events();
     loaded_code_mods.clear();

@@ -67,6 +67,14 @@ namespace recomp {
         static constexpr std::string_view mods_directory = "mods";
         static constexpr std::string_view mod_config_directory = "mod_config";
 
+        // [wcw alpha.6] Boot guard: re-reads /proc/self/maps and verifies every
+        // page patch_func touched during mod load is executable again, before
+        // the game threads start. Returns false and fills error_detail with
+        // the offending page(s) if any patched page is still not executable
+        // (after one RWX recovery attempt per page). No-op that returns true
+        // on Windows.
+        bool verify_patched_pages_executable(std::string& error_detail);
+
         enum class ModOpenError {
             Good,
             DoesNotExist,

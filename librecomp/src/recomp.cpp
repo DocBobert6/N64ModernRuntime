@@ -1075,6 +1075,33 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                     }
                 }
 
+                // [wcw alpha.6] Boot guard: prove every page the mod patcher
+                // touched is executable again BEFORE the entrypoint runs (and
+                // before any game thread spawns). The alpha.4/alpha.5 device
+                // logs proved five .text pages were left rw-p after mod load
+                // and thread 17 faulted fetching its entry function off one
+                // of them. If a page is still not executable, refuse to start
+                // (message box + back to the launcher, mirroring the
+                // mod-load-error pattern above) instead of letting a thread
+                // crash on it. The guard's RWX recovery attempt, if it
+                // succeeds, is logged loudly in the diagnostics log.
+                {
+                    std::string patch_error;
+                    if (!recomp::mods::verify_patched_pages_executable(patch_error)) {
+                        fprintf(stderr, "[recomp] start aborted: patched code page not executable: %s\n", patch_error.c_str());
+                        ultramodern::error_handling::message_box(
+                            ("The game's add-ons could not be switched on safely — a game code page is still not executable after patching:\n\n" + patch_error +
+                             "\n\nThe game was not started. Please export the diagnostics log and send it to Pip.").c_str());
+                        game_status.store(GameStatus::None);
+                        if (exited.load()) {
+                            game_status.store(GameStatus::Quit);
+                            game_status.notify_all();
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+
                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
 
                 save_type = game_entry.save_type;
